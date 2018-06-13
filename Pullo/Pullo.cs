@@ -40,6 +40,12 @@ public class Pullo : IDisposable
 
     #region INIT
 
+    /// <summary>
+    /// Set timeout for each job and retry count on exception
+    /// </summary>
+    /// <param name="timeout"></param>
+    /// <param name="retryCount"></param>
+    /// <returns></returns>
     public Pullo WithTimeout(TimeSpan timeout, int retryCount)
     {
         bool IsCancelationException(Exception e)
@@ -55,6 +61,11 @@ public class Pullo : IDisposable
         return this;
     }
 
+    /// <summary>
+    /// Number of jobs to run in Parallel
+    /// </summary>
+    /// <param name="maxDegreeOfParallelism"></param>
+    /// <returns></returns>
     public Pullo WithMaxDegreeOfParallelism(int maxDegreeOfParallelism)
     {
         _maxDegreeOfParallelism = maxDegreeOfParallelism;
@@ -98,9 +109,18 @@ public class Pullo : IDisposable
 
     public int Size() => _queue?.Count ?? 0;
 
-    public void Stop() => _localCancellation.Cancel();
+    public void Stop()
+    {
+        Done();
+        _localCancellation.Cancel();
+    }
 
-    public void Done() => _queue?.CompleteAdding();
+    /// <summary>Marks the <see cref="Pullo"/> instances as not accepting any more additions.</summary>
+    public void Done()
+    {
+        if (!_queue?.IsAddingCompleted ?? false)
+            _queue?.CompleteAdding();
+    }
 
     public bool IsCompleted { get; private set; }
 
@@ -152,6 +172,10 @@ public class Pullo : IDisposable
         return Run(false);
     }
 
+    /// <summary>
+    /// Start running the jobs, and wait for new jobs until <see cref="Done"/> or <see cref="Stop"/> is called
+    /// </summary>
+    /// <returns></returns>
     public Task StartAndWait() => Run(true);
 
     protected virtual void Dispose(bool disposing)

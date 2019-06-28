@@ -26,7 +26,7 @@ High performance parallel task runner
                 token => Console.WriteLine("Hello Task 4!")
             });
             
-            await pullo.Wait(); //Start running the jobs, and wait for new jobs until Done() or Stop() is called
+            await pullo.Wait(); // Run all the jobs
 
             //pullo.Size();      // Size of queue
             //pullo.Stop();      // Stop processing and cancel all jobs

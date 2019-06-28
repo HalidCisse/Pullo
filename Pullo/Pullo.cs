@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -16,56 +16,65 @@ using Polly.Wrap;
 // ReSharper disable once CheckNamespace
 public class Pullo : IDisposable
 {
-    private Action<ParallelLoopState, Action<CancellationToken>, Exception> _onError;
-    private Action<ParallelLoopState, Action<CancellationToken>> _onStart;
-    private Action<ParallelLoopState, Action<CancellationToken>> _onSuccess;
+    private Action<Func<Task>, Exception> _onError;
+    private Action<Func<Task>> _onStart;
+    private Action<Func<Task>> _onSuccess;
 
     private readonly ILogger<Pullo> _logger;
-    private readonly BlockingCollection<Action<CancellationToken>> _queue;
+    private readonly ConcurrentQueue<Func<Task>> _queue;
     private readonly CancellationTokenSource _localCancellation;
     private CancellationTokenSource _cancellation;
-    private PolicyWrap _resiliencePolicy;
-    private int _maxDegreeOfParallelism = 1;
-    private IEnumerable<Action<CancellationToken>> _tasksEnumerable;
+    private AsyncPolicyWrap _resiliencePolicy;
+    private int _maxDegreeOfParallelism = 100;
+    private readonly ConcurrentQueue<IEnumerable<Func<Task>>> _enumerables;
+    private int _running;
 
-    public Pullo(ILogger<Pullo> logger = null)
+    public Pullo(ILogger<Pullo> logger)
     {
         _logger = logger;
-        _queue = new BlockingCollection<Action<CancellationToken>>();
-        //_queues            = new ConcurrentQueue<IEnumerable<Action<CancellationToken>>>();
-        _resiliencePolicy = Policy.Wrap(Policy.NoOp(), Policy.NoOp());
+
+        _enumerables = new ConcurrentQueue<IEnumerable<Func<Task>>>();
+        _queue = new ConcurrentQueue<Func<Task>>();
+
+        _resiliencePolicy  = Policy.WrapAsync(Policy.NoOpAsync(), Policy.NoOpAsync());
         _localCancellation = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken.None);
-        _cancellation = CancellationTokenSource.CreateLinkedTokenSource(_localCancellation.Token);
+        _cancellation      = CancellationTokenSource.CreateLinkedTokenSource(_localCancellation.Token);
     }
 
     #region INIT
+    private bool IsCancelationException(Exception e)
+    {
+        if (_cancellation.IsCancellationRequested || _localCancellation.IsCancellationRequested)
+            return true;
+        var inner = e;
+        while (inner?.InnerException != null) inner = inner.InnerException;
+        return e is TaskCanceledException || e is OperationCanceledException || inner is TaskCanceledException || inner is OperationCanceledException;
+    }
 
-    /// <summary>
-    /// Set timeout for each job and retry count on exception
-    /// </summary>
-    /// <param name="timeout"></param>
-    /// <param name="retryCount"></param>
-    /// <returns></returns>
     public Pullo WithTimeout(TimeSpan timeout, int retryCount)
     {
-        bool IsCancelationException(Exception e)
-        {
-            var inner = e;
-            while (e.InnerException != null) inner = e.InnerException;
-            return e is TaskCanceledException || e is OperationCanceledException || e is TimeoutRejectedException || inner is TaskCanceledException || inner is OperationCanceledException || inner is TimeoutRejectedException;
-        }
         _resiliencePolicy = Policy
-            .Wrap(Policy.Timeout(timeout, TimeoutStrategy.Optimistic, (context, span, task) => _logger.LogWarning("Task Timeout", context.PolicyKey, span)), Policy
-                .Handle<Exception>(e => !IsCancelationException(e))
-                .WaitAndRetry(retryCount, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), (exception, timeSpan, retries, context) => _logger.LogWarning(exception, exception.Message, retries.ToString())));
+            .WrapAsync(
+                Policy
+                    .TimeoutAsync(timeout, TimeoutStrategy.Optimistic, (context, time, task) =>
+                    {
+                        _logger?.LogWarning($"[TIMEOUT] : {context.PolicyKey} at {context.OperationKey}: execution timed out after {time.TotalSeconds} seconds, task timeout.");
+
+                        return task?.ContinueWith(t => {
+                            if (t.IsFaulted)
+                                _logger?.LogError(
+                                    $"{context.PolicyKey} at {context.OperationKey}: execution timed out after {time.TotalSeconds} seconds, eventually terminated with: {t.Exception}.");
+                            else if (t.IsCanceled)
+                                _logger?.LogWarning(
+                                    $"[CANCELLED] : {context.PolicyKey} at {context.OperationKey}: execution timed out after {time.TotalSeconds} seconds, task canceled.");
+                        });
+                    }),
+                Policy
+                    .Handle<Exception>(e => !IsCancelationException(e))
+                    .WaitAndRetryAsync(retryCount, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), (exception, timeSpan, retries, context) => _logger?.LogWarning(exception, exception.Message, retries.ToString())));
         return this;
     }
 
-    /// <summary>
-    /// Number of jobs to run in Parallel
-    /// </summary>
-    /// <param name="maxDegreeOfParallelism"></param>
-    /// <returns></returns>
     public Pullo WithMaxDegreeOfParallelism(int maxDegreeOfParallelism)
     {
         _maxDegreeOfParallelism = maxDegreeOfParallelism;
@@ -75,29 +84,23 @@ public class Pullo : IDisposable
     public Pullo With(CancellationToken cancellation)
     {
         _cancellation = CancellationTokenSource.CreateLinkedTokenSource(_localCancellation.Token, cancellation);
+        _cancellation.Token.Register(() => IsRunning = false);
         return this;
     }
 
-    //public void With(IEnumerable<Action<CancellationToken>> tasksEnumerable)
-    //{
-    //    if (!IsCompleted && _tasksEnumerable != null || _queue.Any())
-    //        throw new NotSupportedException();
-    //    _tasksEnumerable = tasksEnumerable;
-    //}
-
-    public Pullo OnError(Action<ParallelLoopState, Action<CancellationToken>, Exception> onError)
+    public Pullo OnError(Action<Func<Task>, Exception> onError)
     {
         _onError = onError;
         return this;
     }
 
-    public Pullo OnStart(Action<ParallelLoopState, Action<CancellationToken>> onTaskStart)
+    public Pullo OnStart(Action<Func<Task>> onTaskStart)
     {
         _onStart = onTaskStart;
         return this;
     }
 
-    public Pullo OnSuccess(Action<ParallelLoopState, Action<CancellationToken>> onTaskSuccess)
+    public Pullo OnSuccess(Action<Func<Task>> onTaskSuccess)
     {
         _onSuccess = onTaskSuccess;
         return this;
@@ -105,78 +108,101 @@ public class Pullo : IDisposable
 
     #endregion
 
-    public bool Enqueue(Action<CancellationToken> task) => _queue.TryAdd(task, TimeSpan.FromHours(1).Milliseconds, _cancellation.Token);
+    public Pullo Enqueue(Func<Task> task)
+    {
+        _queue.Enqueue(task);
+        return this;
+    }
 
-    public int Size() => _queue?.Count ?? 0;
+    public Pullo Enqueue(IEnumerable<Func<Task>> tasks)
+    {
+        _enumerables.Enqueue(tasks);
+        return this;
+    }
+
+    public int QueueSize() => _queue?.Count ?? 0;
 
     public void Stop()
     {
-        Done();
         _localCancellation.Cancel();
     }
 
-    /// <summary>Marks the <see cref="Pullo"/> instances as not accepting any more additions.</summary>
-    public void Done()
+    public bool IsRunning { get; private set; }
+
+    private IEnumerable<Func<Task>> Enumerate()
     {
-        if (!_queue?.IsAddingCompleted ?? false)
-            _queue?.CompleteAdding();
+        while ((_enumerables.Any() || _queue.Any()) && !_cancellation.IsCancellationRequested)
+        {
+            while (_queue.TryDequeue(out var task))
+            {
+                _cancellation.Token.ThrowIfCancellationRequested();
+                yield return task;
+            }
+            while (_enumerables.TryDequeue(out var enumerable))
+            {
+                _cancellation.Token.ThrowIfCancellationRequested();
+                foreach (var task in enumerable)
+                {
+                    _cancellation.Token.ThrowIfCancellationRequested();
+                    yield return task;
+                }
+            }
+        }
     }
 
-    public bool IsCompleted { get; private set; }
-
-    private Task Run(bool waitUntilDone)
+    public async Task Wait()
     {
-        IsCompleted = false;
         try
         {
-            Parallel.ForEach(
-                Partitioner.Create(
-                    _tasksEnumerable ?? Enumerable.Empty<Action<CancellationToken>>()
-                        .Concat(_queue.GetConsumingEnumerable(_cancellation.Token)),
-                    EnumerablePartitionerOptions.NoBuffering),
-                new ParallelOptions
+            IsRunning = true;
+
+            await RunAsync(Enumerate(), async task =>
+            {
+                _running++;
+                try
                 {
-                    MaxDegreeOfParallelism = _maxDegreeOfParallelism,
-                    CancellationToken = _cancellation.Token
-                }, (task, loop) =>
+                    _cancellation.Token.ThrowIfCancellationRequested();
+                    _onStart?.Invoke(task);
+                    var result = await _resiliencePolicy.ExecuteAndCaptureAsync(task);
+                    if (result.Outcome == OutcomeType.Failure)
+                    {
+                        if (!IsCancelationException(result.FinalException))
+                            _onError?.Invoke(task, result.FinalException);
+                    }
+                    else
+                        _onSuccess?.Invoke(task);
+                }
+                catch (Exception e)
                 {
-                    try
-                    {
-                        if (loop.ShouldExitCurrentIteration) return;
-                        _onStart?.Invoke(loop, task);
-                        _resiliencePolicy.Execute(task, _cancellation.Token);
-                        _onSuccess?.Invoke(loop, task);
-                        if (!waitUntilDone && _tasksEnumerable == null && _queue.Count == 0) Done();
-                    }
-                    catch (Exception e)
-                    {
-                        _onError?.Invoke(loop, task, e);
-                    }
-                });
+                    if (!IsCancelationException(e))
+                        _onError?.Invoke(task, e);
+                }
+                finally
+                {
+                    _running--;
+                }
+            }, _maxDegreeOfParallelism);
         }
-        catch (Exception e)
+        catch (Exception e) when (!IsCancelationException(e))
         {
-            _logger.LogError(e, e.Message);
+            _logger?.LogError(e, e.Message);
             throw;
         }
         finally
         {
-            IsCompleted = true;
+            IsRunning = false;
         }
-        return Task.CompletedTask;
     }
 
-    public Task Run(IEnumerable<Action<CancellationToken>> tasksEnumerable)
+    private async Task RunAsync<T>(IEnumerable<T> source, Func<T, Task> body, int maxThreadCount)
     {
-        _tasksEnumerable = tasksEnumerable;
-        return Run(false);
+        using var guard = new SemaphoreSlim(maxThreadCount);
+        await Task.WhenAll(
+            source
+                .Select(task => guard.WaitAsync()
+                    .ContinueWith(_ => body(task))
+                    .ContinueWith(_ => guard.Release())));
     }
-
-    /// <summary>
-    /// Start running the jobs, and wait for new jobs until <see cref="Done"/> or <see cref="Stop"/> is called
-    /// </summary>
-    /// <returns></returns>
-    public Task StartAndWait() => Run(true);
 
     protected virtual void Dispose(bool disposing)
     {
@@ -184,12 +210,7 @@ public class Pullo : IDisposable
         try
         {
             _logger.LogInformation("Dispose " + nameof(Pullo));
-            IsCompleted = true;
-            if (!(_queue?.IsAddingCompleted ?? false))
-                _queue?.CompleteAdding();
-            _localCancellation?.Cancel(false);
-            _queue?.Dispose();
-            _localCancellation?.Dispose();
+            IsRunning = false;
         }
         catch (Exception) {/**/}
     }
@@ -200,8 +221,6 @@ public class Pullo : IDisposable
         GC.SuppressFinalize(this);
     }
 
-    ~Pullo()
-    {
-        Dispose(false);
-    }
+    ~Pullo() => Dispose(false);
+       
 }

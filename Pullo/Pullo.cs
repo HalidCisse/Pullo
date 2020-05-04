@@ -196,12 +196,16 @@ public class Pullo : IDisposable
 
     private async Task RunAsync<T>(IEnumerable<T> source, Func<T, Task> body, int maxThreadCount)
     {
-        using var guard = new SemaphoreSlim(maxThreadCount);
-        await Task.WhenAll(
-            source
-                .Select(task => guard.WaitAsync()
-                    .ContinueWith(_ => body(task))
-                    .ContinueWith(_ => guard.Release())));
+        var guard = new SemaphoreSlim(maxThreadCount);
+                await Task.WhenAll(
+                        source
+                            .Select(async task =>
+                                {
+                                     await guard.WaitAsync();
+                                     await body(task);
+                                     guard.Release();
+                                }));
+                guard.Dispose();
     }
 
     protected virtual void Dispose(bool disposing)

@@ -194,19 +194,56 @@ public class Pullo : IDisposable
         }
     }
 
-    private async Task RunAsync<T>(IEnumerable<T> source, Func<T, Task> body, int maxThreadCount)
-    {
-        var guard = new SemaphoreSlim(maxThreadCount);
-                await Task.WhenAll(
-                        source
-                            .Select(async task =>
-                                {
-                                     await guard.WaitAsync();
-                                     await body(task);
-                                     guard.Release();
-                                }));
-                guard.Dispose();
-    }
+    public static async Task RunAsync<T>(
+            this IEnumerable<T> source, Func<T, Task> body,
+            int maxThreadCount,
+            Action<T> onTaskCompleted = default,
+            CancellationToken token = default)
+        {
+            var exceptions = new ConcurrentBag<Exception>();
+            var guard = new SemaphoreSlim(maxThreadCount);
+
+            await Task.WhenAll(EnumerateTasks()
+                .Select(async arg =>
+                {
+                    try
+                    {
+                        await body(arg);
+                    }
+                    catch (Exception e) when (e is TaskCanceledException or TimeoutException or OperationCanceledException){}
+                    catch (Exception e)
+                    {
+                        exceptions.Add(e);
+                    }
+                    finally
+                    {
+                        guard.Release();
+                        onTaskCompleted?.Invoke(arg);
+                    }
+                }));
+
+            IEnumerable<T> EnumerateTasks()
+            {
+                using var enumerator = source.GetEnumerator();
+                do
+                {
+                    guard.Wait(token);
+
+                    if (!enumerator.MoveNext())
+                    {
+                        yield break;
+                    }
+                    yield return enumerator.Current;
+                } while (!token.IsCancellationRequested);
+            }
+
+            guard.Dispose();
+
+            if (exceptions.Any())
+            {
+                throw new AggregateException(exceptions);
+            }
+        }
 
     protected virtual void Dispose(bool disposing)
     {

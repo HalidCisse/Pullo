@@ -1,6 +1,7 @@
 # Pullo
 High performance parallel task runner
 
+````csharp
     class Program
     {
         static void Main(string[] args)
@@ -34,3 +35,4 @@ High performance parallel task runner
             Console.WriteLine("Hello pullo!");
         }
     }
+````
